@@ -1,0 +1,27 @@
+package com.ofss.service;
+
+import java.util.List;
+
+import com.ofss.dto.TransactionDto;
+
+public interface TransactionService {
+
+    TransactionDto createTransaction(TransactionDto request);
+
+    TransactionDto getTransactionById(Long transactionId);
+
+    List<TransactionDto> getAllTransactions();
+
+    TransactionDto updateTransaction(Long transactionId, TransactionDto request);
+
+    TransactionDto patchTransaction(Long transactionId, TransactionDto request);
+
+    void deleteTransaction(Long transactionId);
+    
+    List<TransactionDto> getTransactionsForLoggedInUser(Long userId);
+
+    TransactionDto getTransactionForLoggedInUser(
+            Long transactionId,
+            Long userId
+    );
+}

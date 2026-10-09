@@ -1,0 +1,537 @@
+package com.ofss.service;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.LocalDate;
+import java.time.YearMonth;
+import java.time.ZoneId;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.stream.Collectors;
+
+import org.springframework.stereotype.Service;
+
+import com.ofss.client.ReportingDataClient;
+import com.ofss.dto.ReportModels.AveragePurchaseReport;
+import com.ofss.dto.ReportModels.CardUsageReport;
+import com.ofss.dto.ReportModels.CreditCardView;
+import com.ofss.dto.ReportModels.CustomerAmountReport;
+import com.ofss.dto.ReportModels.CustomerOutstandingReport;
+import com.ofss.dto.ReportModels.CustomerView;
+import com.ofss.dto.ReportModels.DailyTotalReport;
+import com.ofss.dto.ReportModels.MerchantSalesReport;
+import com.ofss.dto.ReportModels.MerchantTransactionCountReport;
+import com.ofss.dto.ReportModels.MerchantView;
+import com.ofss.dto.ReportModels.MonthlySpendingReport;
+import com.ofss.dto.ReportModels.TotalOutstandingReport;
+import com.ofss.dto.ReportModels.TransactionView;
+
+@Service
+public class ReportService {
+
+    private final ReportingDataClient reportingDataClient;
+
+    public ReportService(ReportingDataClient reportingDataClient) {
+        this.reportingDataClient = reportingDataClient;
+    }
+
+    public List<CustomerView> getAllCustomers(String authorizationHeader) {
+        return reportingDataClient.getCustomers(authorizationHeader);
+    }
+
+    public List<CreditCardView> getAllCreditCards(String authorizationHeader) {
+        return reportingDataClient.getCreditCards(authorizationHeader);
+    }
+
+    public List<MerchantView> getAllMerchants(String authorizationHeader) {
+        return reportingDataClient.getMerchants(authorizationHeader);
+    }
+
+    public List<TransactionView> getTransactionHistory(String authorizationHeader) {
+        return reportingDataClient.getTransactions(authorizationHeader);
+    }
+
+    public List<CustomerOutstandingReport> getHighestOutstandingCustomers(
+            String authorizationHeader
+    ) {
+        return customerOutstanding(authorizationHeader, true);
+    }
+
+    public List<CustomerOutstandingReport> getLowestOutstandingCustomers(
+            String authorizationHeader
+    ) {
+        return customerOutstanding(authorizationHeader, false);
+    }
+
+    public List<MerchantSalesReport> getMerchantWithHighestSales(
+            String authorizationHeader
+    ) {
+        List<TransactionView> purchases =
+                successfulPurchases(authorizationHeader);
+
+        Map<Long, MerchantView> merchants = merchantMap(authorizationHeader);
+
+        Map<Long, BigDecimal> salesByMerchant = purchases.stream()
+                .filter(transaction -> transaction.merchantId() != null)
+                .collect(Collectors.groupingBy(
+                        TransactionView::merchantId,
+                        Collectors.reducing(
+                                BigDecimal.ZERO,
+                                this::amount,
+                                BigDecimal::add
+                        )
+                ));
+
+        BigDecimal highestSales = salesByMerchant.values().stream()
+                .max(BigDecimal::compareTo)
+                .orElse(BigDecimal.ZERO);
+
+        return salesByMerchant.entrySet().stream()
+                .filter(entry ->
+                        entry.getValue().compareTo(highestSales) == 0
+                )
+                .map(entry -> {
+                    MerchantView merchant = merchants.get(entry.getKey());
+
+                    return new MerchantSalesReport(
+                            entry.getKey(),
+                            merchant == null
+                                    ? "Unknown Merchant"
+                                    : merchant.merchantName(),
+                            entry.getValue()
+                    );
+                })
+                .toList();
+    }
+
+    public List<MerchantTransactionCountReport>
+            getMerchantWithHighestTransactionCount(
+                    String authorizationHeader
+            ) {
+
+        List<TransactionView> purchases =
+                successfulPurchases(authorizationHeader);
+
+        Map<Long, MerchantView> merchants = merchantMap(authorizationHeader);
+
+        Map<Long, Long> countByMerchant = purchases.stream()
+                .filter(transaction -> transaction.merchantId() != null)
+                .collect(Collectors.groupingBy(
+                        TransactionView::merchantId,
+                        Collectors.counting()
+                ));
+
+        Long highestCount = countByMerchant.values().stream()
+                .max(Long::compareTo)
+                .orElse(0L);
+
+        return countByMerchant.entrySet().stream()
+                .filter(entry -> entry.getValue().equals(highestCount))
+                .map(entry -> {
+                    MerchantView merchant = merchants.get(entry.getKey());
+
+                    return new MerchantTransactionCountReport(
+                            entry.getKey(),
+                            merchant == null
+                                    ? "Unknown Merchant"
+                                    : merchant.merchantName(),
+                            entry.getValue()
+                    );
+                })
+                .toList();
+    }
+
+    public List<CardUsageReport> getMostUsedCards(
+            String authorizationHeader
+    ) {
+        return cardUsage(authorizationHeader, true);
+    }
+
+    public List<CardUsageReport> getLeastUsedCards(
+            String authorizationHeader
+    ) {
+        return cardUsage(authorizationHeader, false);
+    }
+
+    public DailyTotalReport getTodayPurchaseTotal(
+            String authorizationHeader
+    ) {
+        return todayTotal(
+                authorizationHeader,
+                "PURCHASE"
+        );
+    }
+
+    public DailyTotalReport getTodayPaymentTotal(
+            String authorizationHeader
+    ) {
+        return todayTotal(
+                authorizationHeader,
+                "PAYMENT"
+        );
+    }
+
+    public List<CreditCardView> getBlockedCards(
+            String authorizationHeader
+    ) {
+        return reportingDataClient.getCreditCards(authorizationHeader)
+                .stream()
+                .filter(card -> "BLOCKED".equals(card.cardStatus()))
+                .toList();
+    }
+
+    public List<CreditCardView> getCardsBelowTwentyPercent(
+            String authorizationHeader
+    ) {
+        return reportingDataClient.getCreditCards(authorizationHeader)
+                .stream()
+                .filter(card -> card.creditLimit() != null)
+                .filter(card -> card.creditLimit().signum() > 0)
+                .filter(card -> card.availableCredit() != null)
+                .filter(card -> card.availableCredit().compareTo(
+                        card.creditLimit()
+                                .multiply(new BigDecimal("0.20"))
+                ) < 0)
+                .toList();
+    }
+
+    public List<CustomerAmountReport> getHighestSpendingCustomers(
+            String authorizationHeader
+    ) {
+        return customerAmountReport(
+                authorizationHeader,
+                "PURCHASE"
+        );
+    }
+
+    public List<CustomerAmountReport> getHighestPaymentCustomers(
+            String authorizationHeader
+    ) {
+        return customerAmountReport(
+                authorizationHeader,
+                "PAYMENT"
+        );
+    }
+
+    public TotalOutstandingReport getTotalOutstandingAmount(
+            String authorizationHeader
+    ) {
+        BigDecimal total = reportingDataClient
+                .getCreditCards(authorizationHeader)
+                .stream()
+                .map(CreditCardView::outstandingAmount)
+                .filter(Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        return new TotalOutstandingReport(total);
+    }
+
+    public AveragePurchaseReport getAveragePurchaseAmount(
+            String authorizationHeader
+    ) {
+        List<TransactionView> purchases =
+                successfulPurchases(authorizationHeader);
+
+        BigDecimal total = purchases.stream()
+                .map(this::amount)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        BigDecimal average = purchases.isEmpty()
+                ? BigDecimal.ZERO
+                : total.divide(
+                        BigDecimal.valueOf(purchases.size()),
+                        2,
+                        RoundingMode.HALF_UP
+                );
+
+        return new AveragePurchaseReport(
+                average,
+                (long) purchases.size()
+        );
+    }
+
+    public List<TransactionView> getLargestPurchase(
+            String authorizationHeader
+    ) {
+        List<TransactionView> purchases =
+                successfulPurchases(authorizationHeader);
+
+        BigDecimal largestAmount = purchases.stream()
+                .map(this::amount)
+                .max(BigDecimal::compareTo)
+                .orElse(BigDecimal.ZERO);
+
+        return purchases.stream()
+                .filter(transaction ->
+                        amount(transaction).compareTo(largestAmount) == 0
+                )
+                .toList();
+    }
+
+    public List<MonthlySpendingReport> getMonthlySpendingSummary(
+            String authorizationHeader
+    ) {
+        Map<Long, CustomerView> customers = customerMap(authorizationHeader);
+
+        Map<MonthlyKey, BigDecimal> monthlyTotals =
+                successfulPurchases(authorizationHeader)
+                        .stream()
+                        .filter(transaction ->
+                                transaction.transactionDateTime() != null
+                        )
+                        .collect(Collectors.groupingBy(
+                                transaction -> new MonthlyKey(
+                                        transaction.customerId(),
+                                        YearMonth.from(
+                                                transaction
+                                                        .transactionDateTime()
+                                        )
+                                ),
+                                Collectors.reducing(
+                                        BigDecimal.ZERO,
+                                        this::amount,
+                                        BigDecimal::add
+                                )
+                        ));
+
+        return monthlyTotals.entrySet().stream()
+                .map(entry -> {
+                    CustomerView customer =
+                            customers.get(entry.getKey().customerId());
+
+                    return new MonthlySpendingReport(
+                            entry.getKey().month().toString(),
+                            entry.getKey().customerId(),
+                            customer == null
+                                    ? "Unknown Customer"
+                                    : customer.customerName(),
+                            entry.getValue()
+                    );
+                })
+                .sorted(Comparator
+                        .comparing(MonthlySpendingReport::month)
+                        .reversed()
+                        .thenComparing(
+                                MonthlySpendingReport::customerId
+                        ))
+                .toList();
+    }
+
+    private List<CustomerOutstandingReport> customerOutstanding(
+            String authorizationHeader,
+            boolean highest
+    ) {
+        Map<Long, CustomerView> customers = customerMap(authorizationHeader);
+
+        Map<Long, BigDecimal> outstandingByCustomer =
+                reportingDataClient.getCreditCards(authorizationHeader)
+                        .stream()
+                        .collect(Collectors.groupingBy(
+                                CreditCardView::customerId,
+                                Collectors.reducing(
+                                        BigDecimal.ZERO,
+                                        card -> card.outstandingAmount() == null
+                                                ? BigDecimal.ZERO
+                                                : card.outstandingAmount(),
+                                        BigDecimal::add
+                                )
+                        ));
+
+        List<CustomerOutstandingReport> reports =
+                customers.values().stream()
+                        .map(customer -> new CustomerOutstandingReport(
+                                customer.id(),
+                                customer.customerName(),
+                                outstandingByCustomer.getOrDefault(
+                                        customer.id(),
+                                        BigDecimal.ZERO
+                                )
+                        ))
+                        .toList();
+
+        BigDecimal targetAmount = reports.stream()
+                .map(CustomerOutstandingReport::outstandingAmount)
+                .reduce((first, second) -> highest
+                        ? first.max(second)
+                        : first.min(second)
+                )
+                .orElse(BigDecimal.ZERO);
+
+        return reports.stream()
+                .filter(report -> report.outstandingAmount()
+                        .compareTo(targetAmount) == 0)
+                .toList();
+    }
+
+    private List<CardUsageReport> cardUsage(
+            String authorizationHeader,
+            boolean highest
+    ) {
+        Map<String, Long> usageByCard =
+                successfulPurchases(authorizationHeader)
+                        .stream()
+                        .collect(Collectors.groupingBy(
+                                TransactionView::cardNumber,
+                                Collectors.counting()
+                        ));
+
+        List<CardUsageReport> reports =
+                reportingDataClient.getCreditCards(authorizationHeader)
+                        .stream()
+                        .map(card -> new CardUsageReport(
+                                card.cardNumber(),
+                                card.customerId(),
+                                usageByCard.getOrDefault(
+                                        card.cardNumber(),
+                                        0L
+                                )
+                        ))
+                        .toList();
+
+        Long targetCount = reports.stream()
+                .map(CardUsageReport::transactionCount)
+                .reduce((first, second) -> highest
+                        ? Math.max(first, second)
+                        : Math.min(first, second)
+                )
+                .orElse(0L);
+
+        return reports.stream()
+                .filter(report ->
+                        report.transactionCount().equals(targetCount)
+                )
+                .toList();
+    }
+
+    private DailyTotalReport todayTotal(
+            String authorizationHeader,
+            String transactionType
+    ) {
+        LocalDate today = LocalDate.now(ZoneId.of("Asia/Kolkata"));
+
+        BigDecimal total = reportingDataClient
+                .getTransactions(authorizationHeader)
+                .stream()
+                .filter(this::isSuccessful)
+                .filter(transaction -> transactionType.equals(
+                        transaction.transactionType()
+                ))
+                .filter(transaction ->
+                        transaction.transactionDateTime() != null
+                )
+                .filter(transaction -> today.equals(
+                        transaction.transactionDateTime().toLocalDate()
+                ))
+                .map(this::amount)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        return new DailyTotalReport(
+                transactionType,
+                today,
+                total
+        );
+    }
+
+    private List<CustomerAmountReport> customerAmountReport(
+            String authorizationHeader,
+            String transactionType
+    ) {
+        Map<Long, CustomerView> customers = customerMap(authorizationHeader);
+
+        Map<Long, BigDecimal> amountByCustomer =
+                reportingDataClient.getTransactions(authorizationHeader)
+                        .stream()
+                        .filter(this::isSuccessful)
+                        .filter(transaction -> transactionType.equals(
+                                transaction.transactionType()
+                        ))
+                        .collect(Collectors.groupingBy(
+                                TransactionView::customerId,
+                                Collectors.reducing(
+                                        BigDecimal.ZERO,
+                                        this::amount,
+                                        BigDecimal::add
+                                )
+                        ));
+
+        BigDecimal highestAmount = amountByCustomer.values().stream()
+                .max(BigDecimal::compareTo)
+                .orElse(BigDecimal.ZERO);
+        
+        
+
+        return amountByCustomer.entrySet().stream()
+                .filter(entry ->
+                        entry.getValue().compareTo(highestAmount) == 0
+                )
+                .map(entry -> {
+                    CustomerView customer = customers.get(entry.getKey());
+
+                    return new CustomerAmountReport(
+                            entry.getKey(),
+                            customer == null
+                                    ? "Unknown Customer"
+                                    : customer.customerName(),
+                            entry.getValue()
+                    );
+                })
+                .toList();
+    }
+
+    private List<TransactionView> successfulPurchases(
+            String authorizationHeader
+    ) {
+        return reportingDataClient.getTransactions(authorizationHeader)
+                .stream()
+                .filter(this::isSuccessful)
+                .filter(transaction -> "PURCHASE".equals(
+                        transaction.transactionType()
+                ))
+                .toList();
+    }
+
+    private boolean isSuccessful(TransactionView transaction) {
+        return "SUCCESS".equals(transaction.transactionStatus());
+    }
+
+    private BigDecimal amount(TransactionView transaction) {
+        return transaction.amount() == null
+                ? BigDecimal.ZERO
+                : transaction.amount();
+    }
+
+    private Map<Long, CustomerView> customerMap(
+            String authorizationHeader
+    ) {
+        return reportingDataClient.getCustomers(authorizationHeader)
+                .stream()
+                .filter(customer -> customer.id() != null)
+                .collect(Collectors.toMap(
+                        CustomerView::id,
+                        customer -> customer,
+                        (first, second) -> first,
+                        HashMap::new
+                ));
+    }
+
+    private Map<Long, MerchantView> merchantMap(
+            String authorizationHeader
+    ) {
+        return reportingDataClient.getMerchants(authorizationHeader)
+                .stream()
+                .filter(merchant -> merchant.merchantId() != null)
+                .collect(Collectors.toMap(
+                        MerchantView::merchantId,
+                        merchant -> merchant
+                ));
+    }
+
+    private record MonthlyKey(
+            Long customerId,
+            YearMonth month
+    ) {
+    }
+}

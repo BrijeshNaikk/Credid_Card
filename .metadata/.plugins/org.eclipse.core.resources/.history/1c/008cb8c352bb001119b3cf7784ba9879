@@ -1,0 +1,5 @@
+package com.ofss.client;
+
+public class CreditCardServiceClient {
+
+}

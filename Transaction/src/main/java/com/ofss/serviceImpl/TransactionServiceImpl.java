@@ -1,0 +1,514 @@
+package com.ofss.serviceImpl;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.util.List;
+
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import com.ofss.dto.CreditCardStatementDto;
+import com.ofss.dto.TransactionDto;
+import com.ofss.entity.Transaction;
+import com.ofss.entity.TransactionType;
+import com.ofss.exception.BadRequestException;
+import com.ofss.exception.ResourceNotFoundException;
+import com.ofss.repository.TransactionRepository;
+import com.ofss.service.TransactionService;
+import com.ofss.client.CardBalanceResponse;
+import com.ofss.client.CreditCardServiceClient;
+import com.ofss.client.MerchantServiceClient;
+import com.ofss.entity.TransactionStatus;
+
+@Service
+@Transactional
+public class TransactionServiceImpl implements TransactionService {
+
+    private final TransactionRepository transactionRepository;
+    private final CreditCardServiceClient creditCardServiceClient;
+    private final MerchantServiceClient merchantServiceClient;
+
+    public TransactionServiceImpl(
+            TransactionRepository transactionRepository,
+            CreditCardServiceClient creditCardServiceClient,
+            MerchantServiceClient merchantServiceClient
+    ) {
+        this.transactionRepository = transactionRepository;
+        this.creditCardServiceClient = creditCardServiceClient;
+        this.merchantServiceClient = merchantServiceClient;
+    }
+
+    @Override
+    public TransactionDto createTransaction(
+            TransactionDto request,
+            String authorizationHeader
+    ) {
+        validateTransactionDetails(
+                request.transactionType(),
+                request.merchantId()
+        );
+
+        if (request.transactionStatus() != TransactionStatus.SUCCESS
+                && request.transactionStatus() != TransactionStatus.PENDING) {
+
+            throw new BadRequestException(
+                    "New transaction status must be SUCCESS or PENDING"
+            );
+        }
+
+        if (request.transactionType() == TransactionType.PURCHASE) {
+            merchantServiceClient.validateMerchant(
+                    request.merchantId(),
+                    authorizationHeader
+            );
+        }
+
+        CardBalanceResponse card = creditCardServiceClient.getCard(
+                request.cardNumber(),
+                authorizationHeader
+        );
+
+        validateCustomerMatchesCard(
+                request.customerId(),
+                card.customerId()
+        );
+
+        // Only SUCCESS transactions change the CreditCard balance.
+        if (request.transactionStatus() == TransactionStatus.SUCCESS) {
+
+            if (request.transactionType() == TransactionType.PURCHASE) {
+                creditCardServiceClient.debitCard(
+                        request.cardNumber(),
+                        request.amount(),
+                        authorizationHeader
+                );
+            } else {
+                creditCardServiceClient.applyPayment(
+                        request.cardNumber(),
+                        request.amount(),
+                        authorizationHeader
+                );
+            }
+        }
+
+        Transaction transaction = new Transaction();
+
+        transaction.setCardNumber(request.cardNumber());
+        transaction.setTransactionType(request.transactionType());
+        transaction.setCustomerId(card.customerId());
+        transaction.setAmount(request.amount());
+        transaction.setMerchantId(request.merchantId());
+        transaction.setTransactionDateTime(request.transactionDateTime());
+
+        transaction.setTransactionStatus(
+                request.transactionStatus()
+        );
+
+        Transaction savedTransaction =
+                transactionRepository.saveAndFlush(transaction);
+
+        return toDto(savedTransaction);
+    }
+    @Override
+    @Transactional(readOnly = true)
+    public TransactionDto getTransactionById(Long transactionId) {
+
+        validateTransactionId(transactionId);
+
+        return toDto(findTransactionById(transactionId));
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<TransactionDto> getAllTransactions() {
+
+        return transactionRepository.findAll()
+                .stream()
+                .map(this::toDto)
+                .toList();
+    }
+
+    @Override
+    public TransactionDto updateTransaction(
+            Long transactionId,
+            TransactionDto request
+    ) {
+
+        validateTransactionId(transactionId);
+
+        Transaction transaction = findTransactionById(transactionId);
+        
+        preventSuccessfulTransactionChange(transaction);
+
+        validateTransactionDetails(
+                request.transactionType(),
+                request.merchantId()
+        );
+        
+        preventDirectSuccessTransition(
+                request.transactionStatus()
+        );
+
+        transaction.setCardNumber(request.cardNumber());
+        transaction.setTransactionType(request.transactionType());
+        transaction.setCustomerId(request.customerId());
+        transaction.setAmount(request.amount());
+        transaction.setMerchantId(request.merchantId());
+        transaction.setTransactionDateTime(request.transactionDateTime());
+        transaction.setTransactionStatus(request.transactionStatus());
+
+        Transaction updatedTransaction = transactionRepository.save(transaction);
+
+        return toDto(updatedTransaction);
+    }
+
+    @Override
+    public TransactionDto patchTransaction(
+            Long transactionId,
+            TransactionDto request
+    ) {
+
+        validateTransactionId(transactionId);
+
+        Transaction transaction = findTransactionById(transactionId);
+        
+        preventSuccessfulTransactionChange(transaction);
+
+        if (request.cardNumber() != null) {
+            transaction.setCardNumber(request.cardNumber());
+        }
+
+        if (request.transactionType() != null) {
+            transaction.setTransactionType(request.transactionType());
+        }
+
+        if (request.amount() != null) {
+            transaction.setAmount(request.amount());
+        }
+
+        /*
+         * For PURCHASE, merchantId is required.
+         * For PAYMENT, merchantId must be null.
+         *
+         * merchantId is changed only when a transaction type is supplied
+         * in the PATCH request. Use PUT when you must explicitly remove
+         * merchantId from an existing PURCHASE transaction.
+         */
+        if (request.transactionType() != null) {
+            transaction.setMerchantId(request.merchantId());
+        }
+
+        if (request.transactionDateTime() != null) {
+            transaction.setTransactionDateTime(request.transactionDateTime());
+        }
+
+        if (request.transactionStatus() != null) {
+
+            preventDirectSuccessTransition(
+                    request.transactionStatus()
+            );
+
+            transaction.setTransactionStatus(
+                    request.transactionStatus()
+            );
+        }
+
+        validateTransactionDetails(
+                transaction.getTransactionType(),
+                transaction.getMerchantId()
+        );
+
+        Transaction updatedTransaction = transactionRepository.save(transaction);
+
+        return toDto(updatedTransaction);
+    }
+
+    @Override
+    public void deleteTransaction(Long transactionId) {
+
+        validateTransactionId(transactionId);
+
+        Transaction transaction = findTransactionById(transactionId);
+        
+        preventSuccessfulTransactionChange(transaction);
+
+        transactionRepository.delete(transaction);
+    }
+    
+    @Override
+    @Transactional(readOnly = true)
+    public List<TransactionDto> getTransactionsForLoggedInUser(
+            Long userId
+    ) {
+
+        return transactionRepository.findAllByCustomerId(userId)
+                .stream()
+                .map(this::toDto)
+                .toList();
+    }
+    
+    @Override
+    @Transactional(readOnly = true)
+    public TransactionDto getTransactionForLoggedInUser(
+            Long transactionId,
+            Long userId
+    ) {
+
+        Transaction transaction = transactionRepository
+                .findByTransactionIdAndCustomerId(
+                        transactionId,
+                        userId
+                )
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "Transaction",
+                        transactionId.toString()
+                ));
+
+        return toDto(transaction);
+    }
+    
+    @Override
+    @Transactional(readOnly = true)
+    public List<TransactionDto> searchTransactionsByDateRange(
+            LocalDate fromDate,
+            LocalDate toDate
+    ) {
+
+        validateDateRange(fromDate, toDate);
+
+        return transactionRepository
+                .findByTransactionDateTimeBetweenOrderByTransactionDateTimeDesc(
+                        fromDate.atStartOfDay(),
+                        toDate.plusDays(1).atStartOfDay().minusNanos(1)
+                )
+                .stream()
+                .map(this::toDto)
+                .toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<TransactionDto> searchTransactionsByMerchant(
+            Long merchantId
+    ) {
+
+        if (merchantId == null || merchantId <= 0) {
+            throw new BadRequestException(
+                    "Merchant ID must be a positive number"
+            );
+        }
+
+        return transactionRepository
+                .findByMerchantIdOrderByTransactionDateTimeDesc(merchantId)
+                .stream()
+                .map(this::toDto)
+                .toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<TransactionDto> searchTransactionsByAmount(
+            BigDecimal minimumAmount,
+            BigDecimal maximumAmount
+    ) {
+
+        if (minimumAmount == null || maximumAmount == null) {
+            throw new BadRequestException(
+                    "Minimum amount and maximum amount are required"
+            );
+        }
+
+        if (minimumAmount.signum() < 0
+                || maximumAmount.signum() < 0
+                || minimumAmount.compareTo(maximumAmount) > 0) {
+
+            throw new BadRequestException(
+                    "Provide a valid amount range"
+            );
+        }
+
+        return transactionRepository
+                .findByAmountBetweenOrderByTransactionDateTimeDesc(
+                        minimumAmount,
+                        maximumAmount
+                )
+                .stream()
+                .map(this::toDto)
+                .toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public CreditCardStatementDto generateStatement(
+            String cardNumber,
+            LocalDate fromDate,
+            LocalDate toDate,
+            Long customerId
+    ) {
+
+        if (cardNumber == null || cardNumber.isBlank()) {
+            throw new BadRequestException("Card number is required");
+        }
+
+        if (customerId == null || customerId <= 0) {
+            throw new BadRequestException(
+                    "Customer ID must be a positive number"
+            );
+        }
+
+        validateDateRange(fromDate, toDate);
+
+        List<TransactionDto> transactions = transactionRepository
+                .findByCardNumberAndCustomerIdAndTransactionDateTimeBetweenOrderByTransactionDateTimeDesc(
+                        cardNumber,
+                        customerId,
+                        fromDate.atStartOfDay(),
+                        toDate.plusDays(1).atStartOfDay().minusNanos(1)
+                )
+                .stream()
+                .map(this::toDto)
+                .toList();
+
+        BigDecimal purchases = transactions.stream()
+                .filter(transaction ->
+                        transaction.transactionStatus()
+                                .name()
+                                .equals("SUCCESS")
+                )
+                .filter(transaction ->
+                        transaction.transactionType()
+                                .name()
+                                .equals("PURCHASE")
+                )
+                .map(TransactionDto::amount)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        BigDecimal payments = transactions.stream()
+                .filter(transaction ->
+                        transaction.transactionStatus()
+                                .name()
+                                .equals("SUCCESS")
+                )
+                .filter(transaction ->
+                        transaction.transactionType()
+                                .name()
+                                .equals("PAYMENT")
+                )
+                .map(TransactionDto::amount)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        return new CreditCardStatementDto(
+                cardNumber,
+                customerId,
+                fromDate,
+                toDate,
+                purchases,
+                payments,
+                purchases.subtract(payments),
+                transactions
+        );
+    }
+
+    private void validateDateRange(
+            LocalDate fromDate,
+            LocalDate toDate
+    ) {
+
+        if (fromDate == null || toDate == null) {
+            throw new BadRequestException(
+                    "From date and to date are required"
+            );
+        }
+
+        if (fromDate.isAfter(toDate)) {
+            throw new BadRequestException(
+                    "From date cannot be after to date"
+            );
+        }
+    }
+
+    private Transaction findTransactionById(Long transactionId) {
+
+        return transactionRepository.findById(transactionId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "Transaction",
+                        transactionId.toString()
+                ));
+    }
+
+    private void validateTransactionId(Long transactionId) {
+
+        if (transactionId == null || transactionId <= 0) {
+            throw new BadRequestException(
+                    "Transaction ID must be a positive number"
+            );
+        }
+    }
+
+    private void validateTransactionDetails(
+            TransactionType transactionType,
+            Long merchantId
+    ) {
+
+        if (transactionType == TransactionType.PURCHASE
+                && (merchantId == null || merchantId <= 0)) {
+
+            throw new BadRequestException(
+                    "Merchant ID is required for a PURCHASE transaction"
+            );
+        }
+
+        if (transactionType == TransactionType.PAYMENT
+                && merchantId != null) {
+
+            throw new BadRequestException(
+                    "Merchant ID must not be provided for a PAYMENT transaction"
+            );
+        }
+    }
+    
+    private void validateCustomerMatchesCard(
+            Long requestedCustomerId,
+            Long cardCustomerId
+    ) {
+        if (!requestedCustomerId.equals(cardCustomerId)) {
+            throw new BadRequestException(
+                    "The supplied customer ID does not own this credit card"
+            );
+        }
+    }
+    
+    private void preventSuccessfulTransactionChange(
+            Transaction transaction
+    ) {
+        if (transaction.getTransactionStatus() == TransactionStatus.SUCCESS) {
+            throw new BadRequestException(
+                    "A successful financial transaction cannot be updated or deleted"
+            );
+        }
+    }
+    
+    private void preventDirectSuccessTransition(
+            TransactionStatus requestedStatus
+    ) {
+        if (requestedStatus == TransactionStatus.SUCCESS) {
+            throw new BadRequestException(
+                    "Use the Confirm Transaction API to mark a transaction as SUCCESS"
+            );
+        }
+    }
+
+    private TransactionDto toDto(Transaction transaction) {
+
+        return new TransactionDto(
+                transaction.getTransactionId(),
+                transaction.getCardNumber(),
+                transaction.getTransactionType(),
+                transaction.getAmount(),
+                transaction.getMerchantId(),
+                transaction.getTransactionDateTime(),
+                transaction.getTransactionStatus(),
+                transaction.getCustomerId()
+        );
+    }
+}

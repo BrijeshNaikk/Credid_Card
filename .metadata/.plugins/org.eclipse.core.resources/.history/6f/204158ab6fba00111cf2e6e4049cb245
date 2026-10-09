@@ -1,0 +1,240 @@
+package com.ofss.serviceImpl;
+
+import java.util.List;
+
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import com.ofss.dto.TransactionDto;
+import com.ofss.entity.Transaction;
+import com.ofss.entity.TransactionType;
+import com.ofss.exception.BadRequestException;
+import com.ofss.exception.ResourceNotFoundException;
+import com.ofss.repository.TransactionRepository;
+import com.ofss.service.TransactionService;
+
+@Service
+@Transactional
+public class TransactionServiceImpl implements TransactionService {
+
+    private final TransactionRepository transactionRepository;
+
+    public TransactionServiceImpl(TransactionRepository transactionRepository) {
+        this.transactionRepository = transactionRepository;
+    }
+
+    @Override
+    public TransactionDto createTransaction(TransactionDto request) {
+
+        validateTransactionDetails(
+                request.transactionType(),
+                request.merchantId()
+        );
+
+        Transaction transaction = new Transaction();
+
+        transaction.setCardNumber(request.cardNumber());
+        transaction.setTransactionType(request.transactionType());
+        transaction.setAmount(request.amount());
+        transaction.setMerchantId(request.merchantId());
+        transaction.setTransactionDateTime(request.transactionDateTime());
+        transaction.setTransactionStatus(request.transactionStatus());
+
+        Transaction savedTransaction = transactionRepository.save(transaction);
+
+        return toDto(savedTransaction);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public TransactionDto getTransactionById(Long transactionId) {
+
+        validateTransactionId(transactionId);
+
+        return toDto(findTransactionById(transactionId));
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<TransactionDto> getAllTransactions() {
+
+        return transactionRepository.findAll()
+                .stream()
+                .map(this::toDto)
+                .toList();
+    }
+
+    @Override
+    public TransactionDto updateTransaction(
+            Long transactionId,
+            TransactionDto request
+    ) {
+
+        validateTransactionId(transactionId);
+
+        Transaction transaction = findTransactionById(transactionId);
+
+        validateTransactionDetails(
+                request.transactionType(),
+                request.merchantId()
+        );
+
+        transaction.setCardNumber(request.cardNumber());
+        transaction.setTransactionType(request.transactionType());
+        transaction.setAmount(request.amount());
+        transaction.setMerchantId(request.merchantId());
+        transaction.setTransactionDateTime(request.transactionDateTime());
+        transaction.setTransactionStatus(request.transactionStatus());
+
+        Transaction updatedTransaction = transactionRepository.save(transaction);
+
+        return toDto(updatedTransaction);
+    }
+
+    @Override
+    public TransactionDto patchTransaction(
+            Long transactionId,
+            TransactionDto request
+    ) {
+
+        validateTransactionId(transactionId);
+
+        Transaction transaction = findTransactionById(transactionId);
+
+        if (request.cardNumber() != null) {
+            transaction.setCardNumber(request.cardNumber());
+        }
+
+        if (request.transactionType() != null) {
+            transaction.setTransactionType(request.transactionType());
+        }
+
+        if (request.amount() != null) {
+            transaction.setAmount(request.amount());
+        }
+
+        /*
+         * For PURCHASE, merchantId is required.
+         * For PAYMENT, merchantId must be null.
+         *
+         * merchantId is changed only when a transaction type is supplied
+         * in the PATCH request. Use PUT when you must explicitly remove
+         * merchantId from an existing PURCHASE transaction.
+         */
+        if (request.transactionType() != null) {
+            transaction.setMerchantId(request.merchantId());
+        }
+
+        if (request.transactionDateTime() != null) {
+            transaction.setTransactionDateTime(request.transactionDateTime());
+        }
+
+        if (request.transactionStatus() != null) {
+            transaction.setTransactionStatus(request.transactionStatus());
+        }
+
+        validateTransactionDetails(
+                transaction.getTransactionType(),
+                transaction.getMerchantId()
+        );
+
+        Transaction updatedTransaction = transactionRepository.save(transaction);
+
+        return toDto(updatedTransaction);
+    }
+
+    @Override
+    public void deleteTransaction(Long transactionId) {
+
+        validateTransactionId(transactionId);
+
+        Transaction transaction = findTransactionById(transactionId);
+
+        transactionRepository.delete(transaction);
+    }
+    
+    @Override
+    @Transactional(readOnly = true)
+    public List<TransactionDto> getTransactionsForLoggedInUser(
+            Long userId
+    ) {
+
+        return transactionRepository.findAllByCustomerId(userId)
+                .stream()
+                .map(this::toDto)
+                .toList();
+    }
+    
+    @Override
+    @Transactional(readOnly = true)
+    public TransactionDto getTransactionForLoggedInUser(
+            Long transactionId,
+            Long userId
+    ) {
+
+        Transaction transaction = transactionRepository
+                .findByTransactionIdAndCustomerId(
+                        transactionId,
+                        userId
+                )
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "Transaction",
+                        transactionId.toString()
+                ));
+
+        return toDto(transaction);
+    }
+
+    private Transaction findTransactionById(Long transactionId) {
+
+        return transactionRepository.findById(transactionId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "Transaction",
+                        transactionId.toString()
+                ));
+    }
+
+    private void validateTransactionId(Long transactionId) {
+
+        if (transactionId == null || transactionId <= 0) {
+            throw new BadRequestException(
+                    "Transaction ID must be a positive number"
+            );
+        }
+    }
+
+    private void validateTransactionDetails(
+            TransactionType transactionType,
+            Long merchantId
+    ) {
+
+        if (transactionType == TransactionType.PURCHASE
+                && (merchantId == null || merchantId <= 0)) {
+
+            throw new BadRequestException(
+                    "Merchant ID is required for a PURCHASE transaction"
+            );
+        }
+
+        if (transactionType == TransactionType.PAYMENT
+                && merchantId != null) {
+
+            throw new BadRequestException(
+                    "Merchant ID must not be provided for a PAYMENT transaction"
+            );
+        }
+    }
+
+    private TransactionDto toDto(Transaction transaction) {
+
+        return new TransactionDto(
+                transaction.getTransactionId(),
+                transaction.getCardNumber(),
+                transaction.getTransactionType(),
+                transaction.getAmount(),
+                transaction.getMerchantId(),
+                transaction.getTransactionDateTime(),
+                transaction.getTransactionStatus()
+        );
+    }
+}

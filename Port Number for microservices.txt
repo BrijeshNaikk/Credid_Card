@@ -1,0 +1,20 @@
+Port Number for microservices:
+
+1) Reporting-service ---> 8086
+
+2) CreditCard ---> 8083
+
+3) Customer ---> 8081
+
+4) Discovery-microservice ---> 8761
+
+5) Merchant ---> 8084
+
+6) Security-service ---> 8090
+
+7) Transaction ---> 8085
+
+Need to Test apis
+
+GET http://localhost:8086/api/reports/customers/highest-payment
+
